@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Env / secrets
+.env
+pionex-grid-bot/.env
+
+# Logs
+pionex-grid-bot/logs/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
