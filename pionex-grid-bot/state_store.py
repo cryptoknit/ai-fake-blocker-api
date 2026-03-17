@@ -55,6 +55,7 @@ def save(state: GridState) -> None:
         "total_buy_fills":  state.total_buy_fills,
         "total_sell_fills": state.total_sell_fills,
         "realized_pnl":     state.realized_pnl,
+        "processed_fills":  sorted(state.processed_fills),   # set → sorted list for JSON
         "levels": [dataclasses.asdict(lv) for lv in state.levels],
     }
 
@@ -116,6 +117,7 @@ def load() -> tuple[Optional[GridState], bool]:
             total_buy_fills  = int(payload.get("total_buy_fills",    0)),
             total_sell_fills = int(payload.get("total_sell_fills",   0)),
             realized_pnl     = float(payload.get("realized_pnl",     0.0)),
+            processed_fills  = set(payload.get("processed_fills",    [])),
         )
     except (KeyError, TypeError) as exc:
         logger.error("State file is malformed (%s); starting fresh.", exc)

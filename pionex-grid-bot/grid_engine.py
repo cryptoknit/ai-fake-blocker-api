@@ -28,6 +28,9 @@ class GridState:
     total_buy_fills:  int   = 0
     total_sell_fills: int   = 0
     realized_pnl:     float = 0.0   # USDT profit from completed round-trips
+    # Order IDs that have already been processed — guards against double-counting
+    # the same fill during both reconciliation at startup and the live poll cycle.
+    processed_fills: set[str] = field(default_factory=set)
 
 
 def build_grid() -> list[GridLevel]:
@@ -79,6 +82,11 @@ def update_state_from_fills(state: GridState, filled_orders: list[dict]) -> None
         fill_price = float(order.get("price", 0))
         fill_qty   = float(order.get("filledSize") or order.get("size", 0))
 
+        if oid in state.processed_fills:
+            logger.warning("Skipping duplicate fill for order %s (already processed).", oid)
+            continue
+        state.processed_fills.add(oid)
+
         if side == "BUY" and oid in level_by_buy_id:
             lv = level_by_buy_id[oid]
             lv.filled_buy    = True
@@ -98,12 +106,19 @@ def update_state_from_fills(state: GridState, filled_orders: list[dict]) -> None
 
             # P&L: profit comes from the BUY that was placed one level below this SELL.
             # buy_fill_price was stored on THIS level when order_manager set it up.
-            cost_basis = lv.buy_fill_price if lv.buy_fill_price is not None else lv.price
-            profit = (fill_price - cost_basis) * fill_qty
+            cost_basis   = lv.buy_fill_price if lv.buy_fill_price is not None else lv.price
+            gross_profit = (fill_price - cost_basis) * fill_qty
+            # Deduct fees for both legs: buy fee (paid when BUY filled) and
+            # sell fee (paid now).  Both are a fraction of the notional traded.
+            buy_fee  = cost_basis  * fill_qty * config.FEE_RATE
+            sell_fee = fill_price  * fill_qty * config.FEE_RATE
+            profit   = gross_profit - buy_fee - sell_fee
             state.realized_pnl += profit
             logger.info(
-                "SELL filled  level=%d  price=%.6f  cost=%.6f  profit=+%.6f USDT",
-                lv.index, fill_price, cost_basis, profit,
+                "SELL filled  level=%d  price=%.6f  cost=%.6f  "
+                "gross=%.6f  fees=%.6f  net=%.6f USDT",
+                lv.index, fill_price, cost_basis,
+                gross_profit, buy_fee + sell_fee, profit,
             )
             # Reset cost basis now that the cycle is closed
             lv.buy_fill_price = None

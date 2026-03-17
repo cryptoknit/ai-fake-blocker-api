@@ -51,11 +51,16 @@ def check_fills(state: GridState) -> list[dict]:
             if oid and oid not in open_ids and not getattr(lv, already_filled_attr):
                 try:
                     order = client.get_order(config.SYMBOL, oid)
-                    # Only treat as filled if the exchange confirms it
-                    if order.get("status", "").upper() in ("FILLED", "PARTIALLY_FILLED"):
+                    status = order.get("status", "").upper()
+                    if status == "FILLED":
                         filled.append(order)
+                    elif status == "PARTIALLY_FILLED":
+                        # Not yet complete — leave the reference intact and wait
+                        logger.debug(
+                            "Order %s is PARTIALLY_FILLED; waiting for full fill.", oid
+                        )
                     else:
-                        # Order was cancelled externally — clear our reference
+                        # Cancelled externally — clear our reference
                         setattr(lv, oid_attr, None)
                         logger.warning(
                             "Order %s vanished with status %s; clearing reference.",
@@ -122,7 +127,8 @@ def reconcile_saved_state(state: GridState, current_price: float) -> None:
        - Order ID is still in open-orders → nothing to do (order survived).
        - Order ID is absent from open-orders:
          * Fetch the individual order to get its final status.
-         * FILLED / PARTIALLY_FILLED → queue it for fill processing.
+         * FILLED → queue it for fill processing.
+         * PARTIALLY_FILLED → leave the reference intact (not yet complete).
          * Anything else (CANCELLED, etc.) → clear the stale reference so
            the sweep in step 3 can place a fresh order.
     3. Process any offline fills through the normal fill pipeline
@@ -160,7 +166,7 @@ def reconcile_saved_state(state: GridState, current_price: float) -> None:
                 order  = client.get_order(config.SYMBOL, oid)
                 status = order.get("status", "").upper()
 
-                if status in ("FILLED", "PARTIALLY_FILLED"):
+                if status == "FILLED":
                     logger.info(
                         "Offline fill detected: %s order %s at level %d",
                         order.get("side", "?"), oid, lv.index,
@@ -169,6 +175,13 @@ def reconcile_saved_state(state: GridState, current_price: float) -> None:
                     # Clear the ID now; update_state_from_fills will reconcile
                     # the rest of the level's fields as part of normal processing.
                     setattr(lv, oid_attr, None)
+                elif status == "PARTIALLY_FILLED":
+                    # Not yet complete — preserve reference, do not queue as fill
+                    logger.warning(
+                        "Order %s (level %d) is PARTIALLY_FILLED offline; "
+                        "leaving reference intact until fully filled.",
+                        oid, lv.index,
+                    )
                 else:
                     # Externally cancelled or expired
                     logger.warning(

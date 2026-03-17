@@ -28,6 +28,12 @@ LOOP_INTERVAL: int = int(os.getenv("LOOP_INTERVAL", "30"))     # Seconds between
 # When True, no real orders are placed.  Fill simulation is driven by live prices.
 DRY_RUN: bool = os.getenv("DRY_RUN", "false").strip().lower() in ("1", "true", "yes")
 
+# ── Trading fees ──────────────────────────────────────────────────────────────
+# Maker/taker fee rate as a decimal fraction (e.g. 0.001 = 0.1%).
+# Pionex standard taker fee is 0.05 % — set to match your account tier.
+# Fees for both legs of a round-trip (BUY + SELL) are subtracted from P&L.
+FEE_RATE: float = float(os.getenv("FEE_RATE", "0.001"))
+
 # ── Circuit breaker ───────────────────────────────────────────────────────────
 # Cancel all orders and stop the bot if realized losses exceed this amount (USDT).
 # Set to 0 to disable.
@@ -46,5 +52,7 @@ def validate() -> None:
         raise ValueError("GRID_COUNT must be at least 2")
     if INVESTMENT <= 0:
         raise ValueError("INVESTMENT must be positive")
+    if not 0.0 <= FEE_RATE < 1.0:
+        raise ValueError("FEE_RATE must be between 0.0 and 1.0 (e.g. 0.001 for 0.1%)")
     if MAX_LOSS < 0:
         raise ValueError("MAX_LOSS must be >= 0 (use 0 to disable the circuit breaker)")

@@ -3,10 +3,24 @@ tests/test_pnl.py — Replay fill sequences and verify P&L calculation.
 
 These tests use only grid_engine dataclasses; no network calls are made.
 All GridLevel objects are constructed directly so config values don't matter.
+
+The `zero_fees` autouse fixture patches FEE_RATE=0 so that the core P&L math
+tests remain fee-agnostic.  Tests that specifically verify fee deduction opt
+in to a non-zero rate via their own mock.patch context manager.
 """
 
+import unittest.mock as mock
+
 import pytest
+
 from grid_engine import GridLevel, GridState, update_state_from_fills
+
+
+@pytest.fixture(autouse=True)
+def zero_fees():
+    """Patch FEE_RATE to 0 for all tests in this module unless overridden."""
+    with mock.patch("config.FEE_RATE", 0.0):
+        yield
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -217,3 +231,117 @@ class TestBuySellSequence:
         assert abs(state.realized_pnl - expected) < 1e-9
         assert state.total_buy_fills  == 1
         assert state.total_sell_fills == 1
+
+
+# ── Fee deduction ─────────────────────────────────────────────────────────────
+
+class TestFeeDeduction:
+    """Verify that both legs of a round-trip have their fees deducted from P&L."""
+
+    def test_fees_reduce_profit(self):
+        """Net profit = gross − buy_fee − sell_fee."""
+        with mock.patch("config.FEE_RATE", 0.001):
+            lv    = make_level(1, 30_000.0, sell_id="s001", buy_fill_price=29_000.0)
+            state = GridState(levels=[lv])
+            update_state_from_fills(state, [sell_fill("s001", 30_000.0, 0.001)])
+
+        qty        = 0.001
+        gross      = (30_000.0 - 29_000.0) * qty           # 1.0
+        buy_fee    = 29_000.0 * qty * 0.001                 # 0.029
+        sell_fee   = 30_000.0 * qty * 0.001                 # 0.030
+        expected   = gross - buy_fee - sell_fee             # 0.941
+        assert abs(state.realized_pnl - expected) < 1e-9
+
+    def test_fees_applied_to_both_legs(self):
+        """Each fee leg is proportional to its own notional value."""
+        with mock.patch("config.FEE_RATE", 0.002):
+            lv    = make_level(1, 20_000.0, sell_id="s1", buy_fill_price=18_000.0)
+            state = GridState(levels=[lv])
+            update_state_from_fills(state, [sell_fill("s1", 20_000.0, 0.005)])
+
+        qty        = 0.005
+        gross      = (20_000.0 - 18_000.0) * qty
+        buy_fee    = 18_000.0 * qty * 0.002
+        sell_fee   = 20_000.0 * qty * 0.002
+        expected   = gross - buy_fee - sell_fee
+        assert abs(state.realized_pnl - expected) < 1e-9
+
+    def test_zero_fee_rate_leaves_gross_unchanged(self):
+        """FEE_RATE=0 (the autouse default) means net == gross."""
+        # zero_fees fixture already applies; just confirm the formula holds
+        lv    = make_level(1, 30_000.0, sell_id="s001", buy_fill_price=29_000.0)
+        state = GridState(levels=[lv])
+        update_state_from_fills(state, [sell_fill("s001", 30_000.0, 0.001)])
+        expected = (30_000.0 - 29_000.0) * 0.001
+        assert abs(state.realized_pnl - expected) < 1e-9
+
+    def test_fees_can_turn_small_profit_into_loss(self):
+        """If the grid step is smaller than the round-trip fee, net P&L is negative."""
+        with mock.patch("config.FEE_RATE", 0.01):   # 1% — exaggerated for clarity
+            lv    = make_level(1, 29_100.0, sell_id="s001", buy_fill_price=29_000.0)
+            state = GridState(levels=[lv])
+            update_state_from_fills(state, [sell_fill("s001", 29_100.0, 0.01)])
+
+        # gross = 100 * 0.01 = 1.0 USDT; fees > 1.0 at 1% rate
+        assert state.realized_pnl < 0.0
+
+    def test_buy_fill_does_not_deduct_fees(self):
+        """Fees are only deducted when the SELL fills (closing the round-trip)."""
+        with mock.patch("config.FEE_RATE", 0.001):
+            lv    = make_level(0, 29_000.0, buy_id="b001")
+            state = GridState(levels=[lv])
+            update_state_from_fills(state, [buy_fill("b001", 29_000.0, 0.001)])
+
+        assert state.realized_pnl == 0.0
+
+
+# ── Duplicate fill prevention ─────────────────────────────────────────────────
+
+class TestDuplicateFillPrevention:
+    """Verify processed_fills blocks the same order ID from being counted twice."""
+
+    def test_duplicate_buy_fill_is_skipped(self):
+        lv    = make_level(0, 29_000.0, buy_id="b001")
+        state = GridState(levels=[lv])
+        fill  = buy_fill("b001", 29_000.0, 0.001)
+
+        update_state_from_fills(state, [fill])
+        # Re-add the order ID to the level to simulate a re-delivery scenario
+        lv.buy_order_id = "b001"
+        update_state_from_fills(state, [fill])
+
+        assert state.total_buy_fills == 1       # counted only once
+
+    def test_duplicate_sell_fill_does_not_double_pnl(self):
+        lv    = make_level(1, 30_000.0, sell_id="s001", buy_fill_price=29_000.0)
+        state = GridState(levels=[lv])
+        fill  = sell_fill("s001", 30_000.0, 0.001)
+
+        update_state_from_fills(state, [fill])
+        first_pnl = state.realized_pnl
+
+        # Simulate same fill arriving again (e.g. from both reconciliation and live poll)
+        lv.sell_order_id  = "s001"
+        lv.buy_fill_price = 29_000.0
+        update_state_from_fills(state, [fill])
+
+        assert state.realized_pnl == first_pnl  # not doubled
+        assert state.total_sell_fills == 1      # counted only once
+
+    def test_order_id_added_to_processed_set(self):
+        lv    = make_level(0, 29_000.0, buy_id="b001")
+        state = GridState(levels=[lv])
+        update_state_from_fills(state, [buy_fill("b001", 29_000.0, 0.001)])
+        assert "b001" in state.processed_fills
+
+    def test_different_order_ids_both_processed(self):
+        lv_a  = make_level(0, 29_000.0, buy_id="bA")
+        lv_b  = make_level(1, 30_000.0, buy_id="bB")
+        state = GridState(levels=[lv_a, lv_b])
+        update_state_from_fills(state, [
+            buy_fill("bA", 29_000.0, 0.001),
+            buy_fill("bB", 30_000.0, 0.001),
+        ])
+        assert state.total_buy_fills == 2
+        assert "bA" in state.processed_fills
+        assert "bB" in state.processed_fills

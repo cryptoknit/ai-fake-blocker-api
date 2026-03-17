@@ -97,6 +97,55 @@ class TestRoundtrip:
         assert lv.sell_order_id is None
         assert lv.buy_fill_price is None
 
+    def test_processed_fills_survive_roundtrip(self, tmp_path):
+        with _mock_config():
+            import state_store
+            state_store.STATE_FILE = str(tmp_path / "grid_state.json")
+
+            state = GridState(levels=[GridLevel(index=0, price=29_000.0)])
+            state.processed_fills = {"ord-001", "ord-002", "ord-003"}
+            state_store.save(state)
+            recovered, _ = state_store.load()
+
+        assert recovered.processed_fills == {"ord-001", "ord-002", "ord-003"}
+
+    def test_empty_processed_fills_survive_roundtrip(self, tmp_path):
+        with _mock_config():
+            import state_store
+            state_store.STATE_FILE = str(tmp_path / "grid_state.json")
+
+            state = GridState(levels=[GridLevel(index=0, price=29_000.0)])
+            state_store.save(state)
+            recovered, _ = state_store.load()
+
+        assert recovered.processed_fills == set()
+
+    def test_missing_processed_fills_key_defaults_to_empty(self, tmp_path):
+        """State files saved before processed_fills was added load without error."""
+        import json
+        path = str(tmp_path / "grid_state.json")
+        legacy = {
+            "saved_at": "2024-01-01T00:00:00+00:00",
+            "config": {"symbol": "BTC_USDT", "grid_lower": 25_000.0,
+                       "grid_upper": 35_000.0, "grid_count": 10},
+            "last_price": 29_000.0, "total_buy_fills": 0,
+            "total_sell_fills": 0, "realized_pnl": 0.0,
+            "levels": [{"index": 0, "price": 29_000.0, "buy_order_id": None,
+                        "sell_order_id": None, "filled_buy": False,
+                        "filled_sell": False, "buy_fill_price": None}],
+            # intentionally missing "processed_fills"
+        }
+        with open(path, "w") as fh:
+            json.dump(legacy, fh)
+
+        with _mock_config():
+            import state_store
+            state_store.STATE_FILE = path
+            recovered, _ = state_store.load()
+
+        assert recovered is not None
+        assert recovered.processed_fills == set()
+
 
 # ── No saved state ────────────────────────────────────────────────────────────
 
