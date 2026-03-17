@@ -26,34 +26,43 @@ def main() -> None:
         print(f"Configuration error: {exc}")
         sys.exit(1)
 
-    logger.info("Starting Pionex Grid Bot | symbol=%s | range=[%.4f, %.4f] | levels=%d",
-                config.SYMBOL, config.GRID_LOWER, config.GRID_UPPER, config.GRID_COUNT)
+    logger.info(
+        "Starting Pionex Grid Bot | symbol=%s | range=[%.6f, %.6f] | levels=%d | invest=%.2f USDT",
+        config.SYMBOL, config.GRID_LOWER, config.GRID_UPPER,
+        config.GRID_COUNT, config.INVESTMENT,
+    )
 
     # ── Build initial grid ────────────────────────────────────────────────────
-    state = GridState(levels=build_grid())
+    state      = GridState(levels=build_grid())
     start_time = time.time()
-    cycle = 0
+    cycle      = 0
 
     try:
-        # ── Initial order placement ───────────────────────────────────────────
-        current_price = client.get_price(config.SYMBOL)
-        state.last_price = current_price
+        # ── Fetch price & place initial orders ────────────────────────────────
+        current_price      = client.get_price(config.SYMBOL)
+        state.last_price   = current_price
         place_grid_orders(state, current_price)
 
-        # ── Main loop ─────────────────────────────────────────────────────────
+        # Show status immediately (before first sleep)
+        display_status(state, current_price, start_time, cycle)
+        log_cycle_summary(state, current_price, cycle)
+
+        # ── Main polling loop ─────────────────────────────────────────────────
         while True:
+            time.sleep(config.LOOP_INTERVAL)
             cycle += 1
+
             try:
-                current_price = client.get_price(config.SYMBOL)
+                current_price    = client.get_price(config.SYMBOL)
                 state.last_price = current_price
 
-                # 1. Detect filled orders
+                # 1. Detect & process filled orders
                 filled_orders = check_fills(state)
                 if filled_orders:
                     update_state_from_fills(state, filled_orders)
                     replace_filled_orders(state)
 
-                # 2. Display live status
+                # 2. Refresh console display
                 display_status(state, current_price, start_time, cycle)
                 log_cycle_summary(state, current_price, cycle)
 
@@ -62,16 +71,18 @@ def main() -> None:
             except Exception as exc:
                 alert(f"Unhandled error in cycle {cycle}: {exc}")
                 logger.exception("Cycle %d error", cycle)
-
-            time.sleep(config.LOOP_INTERVAL)
+                # Display last known state even if the cycle errored
+                display_status(state, state.last_price, start_time, cycle)
 
     except KeyboardInterrupt:
         print("\n\nStopping bot — cancelling all open orders …")
-        logger.info("KeyboardInterrupt received; cancelling orders.")
+        logger.info("KeyboardInterrupt received; cancelling all orders.")
         cancel_all_orders(state)
-        logger.info("All orders cancelled. Bot stopped. Final P&L: %.4f USDT",
-                    state.realized_pnl)
-        print(f"Final realized P&L: {state.realized_pnl:+.4f} USDT")
+        logger.info(
+            "All orders cancelled.  Bot stopped.  Final realized P&L: %.6f USDT",
+            state.realized_pnl,
+        )
+        print(f"Final realized P&L: {state.realized_pnl:+.6f} USDT")
         sys.exit(0)
 
 

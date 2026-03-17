@@ -4,6 +4,7 @@ grid_engine.py — Grid level calculation and state management
 
 from dataclasses import dataclass, field
 from typing import Optional
+
 import config
 from logger import logger
 
@@ -11,33 +12,37 @@ from logger import logger
 @dataclass
 class GridLevel:
     index: int
-    price: float
-    buy_order_id: Optional[str] = None
+    price: float                          # price at which the order is placed
+    buy_order_id:  Optional[str] = None
     sell_order_id: Optional[str] = None
-    filled_buy: bool = False
-    filled_sell: bool = False
+    filled_buy:    bool = False
+    filled_sell:   bool = False
+    # Cost basis recorded when a BUY fills, used for P&L on the paired SELL
+    buy_fill_price: Optional[float] = None
 
 
 @dataclass
 class GridState:
     levels: list[GridLevel] = field(default_factory=list)
     last_price: float = 0.0
-    total_buy_fills: int = 0
-    total_sell_fills: int = 0
-    realized_pnl: float = 0.0   # USDT profit from completed round-trips
+    total_buy_fills:  int   = 0
+    total_sell_fills: int   = 0
+    realized_pnl:     float = 0.0   # USDT profit from completed round-trips
 
 
 def build_grid() -> list[GridLevel]:
     """
-    Compute evenly-spaced price levels between GRID_LOWER and GRID_UPPER.
-    Returns a list of GridLevel objects sorted ascending by price.
+    Compute GRID_COUNT + 1 evenly-spaced price levels between GRID_LOWER and
+    GRID_UPPER, creating GRID_COUNT grid intervals.  Returns the list sorted
+    ascending by price (index 0 = bottom).
     """
     levels: list[GridLevel] = []
     for i in range(config.GRID_COUNT + 1):
         price = config.GRID_LOWER + i * config.GRID_STEP
         levels.append(GridLevel(index=i, price=round(price, 8)))
+
     logger.info(
-        "Grid built: %d levels from %.4f to %.4f (step %.4f)",
+        "Grid built: %d levels from %.6f to %.6f  (step %.6f)",
         len(levels), levels[0].price, levels[-1].price, config.GRID_STEP,
     )
     return levels
@@ -45,46 +50,60 @@ def build_grid() -> list[GridLevel]:
 
 def quantity_per_grid(grid_levels: list[GridLevel]) -> float:
     """
-    Distribute the total INVESTMENT evenly across all buy levels below
-    the current price. Returns the base-asset quantity per grid cell.
+    Distribute INVESTMENT evenly across all GRID_COUNT intervals.
+    Uses the lower-bound price of the first interval as a conservative
+    denominator so the bot never over-invests.
 
-    Falls back to dividing by total levels if price is unavailable yet.
+    Returns base-asset quantity (rounded to 6 decimal places).
     """
-    # Each grid interval gets an equal share of the investment (in USDT)
-    usdt_per_level = config.INVESTMENT / config.GRID_COUNT
-    # mid-price of first interval as a conservative denominator
-    mid_price = (grid_levels[0].price + grid_levels[1].price) / 2
-    qty = usdt_per_level / mid_price
+    usdt_per_interval = config.INVESTMENT / config.GRID_COUNT
+    # Use the bottom level price as denominator (worst-case cost per unit)
+    qty = usdt_per_interval / grid_levels[0].price
     return round(qty, 6)
 
 
 def update_state_from_fills(state: GridState, filled_orders: list[dict]) -> None:
     """
     Reconcile GridState after receiving a batch of fill notifications.
-    *filled_orders* is a list of order dicts from the exchange.
+
+    *filled_orders* is a list of order dicts returned by get_order().
+    For BUY fills  → mark level, record buy_fill_price for P&L tracking.
+    For SELL fills → compute profit as (sell_fill_price − paired buy_fill_price) × qty.
     """
     level_by_buy_id  = {lv.buy_order_id:  lv for lv in state.levels if lv.buy_order_id}
     level_by_sell_id = {lv.sell_order_id: lv for lv in state.levels if lv.sell_order_id}
 
     for order in filled_orders:
-        oid  = order.get("orderId")
-        side = order.get("side", "").upper()
+        oid        = order.get("orderId")
+        side       = order.get("side", "").upper()
         fill_price = float(order.get("price", 0))
-        fill_qty   = float(order.get("filledSize", 0))
+        fill_qty   = float(order.get("filledSize") or order.get("size", 0))
 
         if side == "BUY" and oid in level_by_buy_id:
             lv = level_by_buy_id[oid]
-            lv.filled_buy = True
+            lv.filled_buy    = True
+            lv.buy_fill_price = fill_price
+            lv.buy_order_id  = None        # slot is now free; a new buy can be placed later
             state.total_buy_fills += 1
-            logger.info("BUY filled at level %d (price=%.4f)", lv.index, lv.price)
+            logger.info(
+                "BUY  filled  level=%d  price=%.6f  qty=%.6f",
+                lv.index, fill_price, fill_qty,
+            )
 
         elif side == "SELL" and oid in level_by_sell_id:
             lv = level_by_sell_id[oid]
-            lv.filled_sell = True
+            lv.filled_sell    = True
+            lv.sell_order_id  = None       # slot is free; a new sell can be placed later
             state.total_sell_fills += 1
-            profit = (fill_price - lv.price) * fill_qty
+
+            # P&L: profit comes from the BUY that was placed one level below this SELL.
+            # buy_fill_price was stored on THIS level when order_manager set it up.
+            cost_basis = lv.buy_fill_price if lv.buy_fill_price is not None else lv.price
+            profit = (fill_price - cost_basis) * fill_qty
             state.realized_pnl += profit
             logger.info(
-                "SELL filled at level %d (price=%.4f) → PnL +%.4f USDT",
-                lv.index, fill_price, profit,
+                "SELL filled  level=%d  price=%.6f  cost=%.6f  profit=+%.6f USDT",
+                lv.index, fill_price, cost_basis, profit,
             )
+            # Reset cost basis now that the cycle is closed
+            lv.buy_fill_price = None
