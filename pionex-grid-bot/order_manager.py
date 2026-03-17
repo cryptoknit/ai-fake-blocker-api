@@ -4,7 +4,7 @@ order_manager.py — Place, cancel, and monitor grid orders
 
 import pionex_client as client
 import config
-from grid_engine import GridLevel, GridState, quantity_per_grid
+from grid_engine import GridLevel, GridState, quantity_per_grid, update_state_from_fills
 from logger import logger, alert
 
 
@@ -107,6 +107,92 @@ def replace_filled_orders(state: GridState) -> None:
                         i, lower_idx, lower.buy_order_id,
                     )
             lv.filled_sell = False            # clear flag regardless
+
+
+# ── Crash-recovery reconciliation ────────────────────────────────────────────
+
+def reconcile_saved_state(state: GridState, current_price: float) -> None:
+    """
+    Called at startup when a saved state is reloaded after a crash or restart.
+
+    Algorithm
+    ---------
+    1. Fetch all currently open orders from the exchange.
+    2. Walk every level in the saved state:
+       - Order ID is still in open-orders → nothing to do (order survived).
+       - Order ID is absent from open-orders:
+         * Fetch the individual order to get its final status.
+         * FILLED / PARTIALLY_FILLED → queue it for fill processing.
+         * Anything else (CANCELLED, etc.) → clear the stale reference so
+           the sweep in step 3 can place a fresh order.
+    3. Process any offline fills through the normal fill pipeline
+       (update_state_from_fills → replace_filled_orders).
+    4. Sweep with place_grid_orders to re-place orders for every level that
+       now has an empty slot (idempotent — skips levels that already have IDs).
+
+    This means the bot resumes exactly where it left off, regardless of how
+    many orders filled or were cancelled while it was offline.
+    """
+    logger.info("Reconciling saved state with exchange …")
+
+    try:
+        open_orders = client.get_open_orders(config.SYMBOL)
+    except Exception as exc:
+        alert(f"Reconciliation: failed to fetch open orders: {exc}")
+        logger.warning("Skipping reconciliation; will attempt fresh order sweep.")
+        place_grid_orders(state, current_price)
+        return
+
+    open_ids = {o["orderId"] for o in open_orders}
+    offline_fills: list[dict] = []
+
+    for lv in state.levels:
+        for oid_attr in ("buy_order_id", "sell_order_id"):
+            oid = getattr(lv, oid_attr)
+            if oid is None:
+                continue                       # slot was already empty in saved state
+            if oid in open_ids:
+                logger.debug("Level %d order %s still open — keeping.", lv.index, oid)
+                continue                       # order survived the downtime intact
+
+            # Order is gone from the open-orders list — find out why
+            try:
+                order  = client.get_order(config.SYMBOL, oid)
+                status = order.get("status", "").upper()
+
+                if status in ("FILLED", "PARTIALLY_FILLED"):
+                    logger.info(
+                        "Offline fill detected: %s order %s at level %d",
+                        order.get("side", "?"), oid, lv.index,
+                    )
+                    offline_fills.append(order)
+                    # Clear the ID now; update_state_from_fills will reconcile
+                    # the rest of the level's fields as part of normal processing.
+                    setattr(lv, oid_attr, None)
+                else:
+                    # Externally cancelled or expired
+                    logger.warning(
+                        "Order %s (level %d) has status %s — clearing stale reference.",
+                        oid, lv.index, status,
+                    )
+                    setattr(lv, oid_attr, None)
+
+            except Exception as exc:
+                logger.warning(
+                    "Could not verify order %s at level %d during reconciliation: %s",
+                    oid, lv.index, exc,
+                )
+                # Conservatively clear the reference; a fresh order will be placed
+                setattr(lv, oid_attr, None)
+
+    if offline_fills:
+        logger.info("Processing %d offline fill(s) …", len(offline_fills))
+        update_state_from_fills(state, offline_fills)
+        replace_filled_orders(state)
+
+    # Re-place orders for any level that now has an open slot
+    place_grid_orders(state, current_price)
+    logger.info("Reconciliation complete.")
 
 
 # ── Cancel everything ─────────────────────────────────────────────────────────
