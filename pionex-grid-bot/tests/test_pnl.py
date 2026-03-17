@@ -345,3 +345,34 @@ class TestDuplicateFillPrevention:
         assert state.total_buy_fills == 2
         assert "bA" in state.processed_fills
         assert "bB" in state.processed_fills
+
+    def test_duplicate_fill_is_ignored(self):
+        """Calling update_state_from_fills twice with the same fill counts it only once."""
+        lv    = make_level(0, 29_000.0, buy_id="b001")
+        state = GridState(levels=[lv])
+        fill  = buy_fill("b001", 29_000.0, 0.001)
+
+        update_state_from_fills(state, [fill])
+        # Restore order ID to simulate re-delivery of the same fill notification
+        lv.buy_order_id = "b001"
+        update_state_from_fills(state, [fill])
+
+        assert state.total_buy_fills == 1
+
+
+# ── Named fee test (matches review checklist) ─────────────────────────────────
+
+class TestFeeReducesProfit:
+
+    def test_fee_reduces_profit_correctly(self):
+        """Net P&L = (sell − buy) × qty − buy_fee − sell_fee with FEE_RATE=0.001."""
+        with mock.patch("config.FEE_RATE", 0.001):
+            lv    = make_level(1, 30_000.0, sell_id="s001", buy_fill_price=29_000.0)
+            state = GridState(levels=[lv])
+            update_state_from_fills(state, [sell_fill("s001", 30_000.0, 0.001)])
+
+        qty      = 0.001
+        expected = (30_000.0 - 29_000.0) * qty \
+                   - 29_000.0 * qty * 0.001 \
+                   - 30_000.0 * qty * 0.001
+        assert abs(state.realized_pnl - expected) < 1e-9
