@@ -21,8 +21,12 @@ GRID_COUNT: int   = int(os.getenv("GRID_COUNT", "10"))         # Number of grid 
 INVESTMENT: float = float(os.getenv("INVESTMENT", "1000"))     # Total USDT to invest
 
 # ── Order / loop settings ─────────────────────────────────────────────────────
-ORDER_TYPE: str  = os.getenv("ORDER_TYPE", "LIMIT")   # LIMIT or MARKET
-LOOP_INTERVAL: int = int(os.getenv("LOOP_INTERVAL", "30"))  # Seconds between cycles
+ORDER_TYPE: str    = os.getenv("ORDER_TYPE", "LIMIT")          # LIMIT or MARKET
+LOOP_INTERVAL: int = int(os.getenv("LOOP_INTERVAL", "30"))     # Seconds between cycles
+
+# ── Dry-run mode ───────────────────────────────────────────────────────────────
+# When True, no real orders are placed.  Fill simulation is driven by live prices.
+DRY_RUN: bool = os.getenv("DRY_RUN", "false").strip().lower() in ("1", "true", "yes")
 
 # ── Derived grid step ─────────────────────────────────────────────────────────
 GRID_STEP: float = (GRID_UPPER - GRID_LOWER) / GRID_COUNT

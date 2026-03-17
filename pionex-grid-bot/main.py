@@ -26,11 +26,24 @@ def main() -> None:
         print(f"Configuration error: {exc}")
         sys.exit(1)
 
+    if config.DRY_RUN:
+        print("=" * 60)
+        print("  *** DRY-RUN MODE — no real orders will be placed ***")
+        print("=" * 60)
+        logger.info("DRY-RUN mode enabled.")
+
     logger.info(
         "Starting Pionex Grid Bot | symbol=%s | range=[%.6f, %.6f] | levels=%d | invest=%.2f USDT",
         config.SYMBOL, config.GRID_LOWER, config.GRID_UPPER,
         config.GRID_COUNT, config.INVESTMENT,
     )
+
+    # ── Verify API credentials before doing anything else ────────────────────
+    try:
+        client.check_credentials()
+    except RuntimeError as exc:
+        print(f"\nStartup error: {exc}")
+        sys.exit(1)
 
     # ── Build initial grid ────────────────────────────────────────────────────
     state      = GridState(levels=build_grid())
@@ -39,8 +52,8 @@ def main() -> None:
 
     try:
         # ── Fetch price & place initial orders ────────────────────────────────
-        current_price      = client.get_price(config.SYMBOL)
-        state.last_price   = current_price
+        current_price    = client.get_price(config.SYMBOL)
+        state.last_price = current_price
         place_grid_orders(state, current_price)
 
         # Show status immediately (before first sleep)
@@ -55,6 +68,12 @@ def main() -> None:
             try:
                 current_price    = client.get_price(config.SYMBOL)
                 state.last_price = current_price
+
+                # In dry-run mode advance the simulated order book before
+                # checking fills so the cycle sees up-to-date statuses.
+                if config.DRY_RUN:
+                    import dry_run
+                    dry_run.simulate_fills(current_price)
 
                 # 1. Detect & process filled orders
                 filled_orders = check_fills(state)

@@ -4,6 +4,11 @@ pionex_client.py — All Pionex REST API calls (auth, orders, balances, prices)
 Auth: HMAC-SHA256.  The signature message is:
     {path}?{url-encoded sorted query params including key & timestamp}
 
+When config.DRY_RUN is True, all mutating calls (place/cancel/query orders,
+balances) are delegated to dry_run.py — no real HTTP requests are made for
+those.  Market-data calls (get_ticker, get_price) always hit the live API so
+fill simulation is driven by real prices.
+
 Docs: https://pionex-doc.gitbook.io/apidocs
 """
 
@@ -126,7 +131,7 @@ def _request(
     raise last_exc
 
 
-# ── Market data ───────────────────────────────────────────────────────────────
+# ── Market data (always live — dry-run still uses real prices) ────────────────
 
 def get_ticker(symbol: str) -> dict:
     """Return latest ticker dict (close, bid, ask, volume, …) for *symbol*."""
@@ -146,6 +151,11 @@ def get_price(symbol: str) -> float:
 
 def get_balances() -> dict[str, float]:
     """Return {asset: free_balance} for every non-zero balance in the account."""
+    if config.DRY_RUN:
+        import dry_run
+        data = dry_run.get_balances()
+        return {b["coinType"]: float(b["free"]) for b in data.get("balances", [])}
+
     data = _request("GET", "/api/v1/account/balances", signed=True)
     return {
         b["coinType"]: float(b["free"])
@@ -154,7 +164,40 @@ def get_balances() -> dict[str, float]:
     }
 
 
-# ── Orders ────────────────────────────────────────────────────────────────────
+# ── Startup credential check ──────────────────────────────────────────────────
+
+def check_credentials() -> None:
+    """
+    Verify that the configured API credentials are accepted by the exchange
+    before the bot places any orders.
+
+    Raises RuntimeError with a clear message on failure so the bot aborts
+    at startup rather than discovering bad credentials mid-run.
+
+    Skipped in DRY_RUN mode (no real credentials needed).
+    """
+    if config.DRY_RUN:
+        logger.info("DRY-RUN mode — skipping credential check.")
+        return
+
+    logger.info("Verifying API credentials…")
+    try:
+        balances = get_balances()
+        summary = {k: f"{v:.6f}" for k, v in balances.items()} if balances else "(empty)"
+        logger.info("Credentials OK.  Balances: %s", summary)
+    except HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else 0
+        if status in (401, 403):
+            raise RuntimeError(
+                "API credentials rejected by Pionex (HTTP %d). "
+                "Check PIONEX_API_KEY and PIONEX_API_SECRET in your .env file." % status
+            ) from exc
+        raise RuntimeError(f"Credential check failed with HTTP {status}: {exc}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Credential check failed: {exc}") from exc
+
+
+# ── Orders (delegated to dry_run when DRY_RUN=true) ──────────────────────────
 
 def place_order(
     symbol: str,
@@ -166,9 +209,14 @@ def place_order(
     """
     Place a single order.  Returns the raw order dict from the API.
 
-    Auth params (key/timestamp/signature) go in the query string.
-    The order payload goes in the JSON body — it is NOT part of the signature.
+    In DRY_RUN mode the order is registered in the simulated order book only.
+    In live mode auth params go in the query string; the order payload goes in
+    the JSON body (not part of the HMAC signature).
     """
+    if config.DRY_RUN:
+        import dry_run
+        return dry_run.place_order(symbol, side, price, quantity, order_type)
+
     path = "/api/v1/trade/order"
     json_body = {
         "symbol": symbol,
@@ -186,6 +234,10 @@ def place_order(
 
 def cancel_order(symbol: str, order_id: str) -> dict:
     """Cancel an open order by ID.  Returns the cancelled order dict."""
+    if config.DRY_RUN:
+        import dry_run
+        return dry_run.cancel_order(symbol, order_id)
+
     logger.info("Cancelling order %s on %s", order_id, symbol)
     return _request(
         "DELETE",
@@ -197,6 +249,10 @@ def cancel_order(symbol: str, order_id: str) -> dict:
 
 def get_open_orders(symbol: str) -> list[dict]:
     """Return all open orders for *symbol*."""
+    if config.DRY_RUN:
+        import dry_run
+        return dry_run.get_open_orders(symbol).get("orders", [])
+
     data = _request(
         "GET",
         "/api/v1/trade/openOrders",
@@ -208,6 +264,10 @@ def get_open_orders(symbol: str) -> list[dict]:
 
 def get_order(symbol: str, order_id: str) -> dict:
     """Fetch a single order by ID and return its dict."""
+    if config.DRY_RUN:
+        import dry_run
+        return dry_run.get_order(symbol, order_id)
+
     return _request(
         "GET",
         "/api/v1/trade/order",

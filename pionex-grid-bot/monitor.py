@@ -23,8 +23,9 @@ def display_status(state: GridState, current_price: float,
     h, rem = divmod(int(elapsed), 3600)
     m, s   = divmod(rem, 60)
 
+    dry_tag = "  *** DRY-RUN — no real orders ***" if config.DRY_RUN else ""
     print("=" * 60)
-    print(f"  Pionex Grid Bot  —  {config.SYMBOL}")
+    print(f"  Pionex Grid Bot  —  {config.SYMBOL}{dry_tag}")
     print(f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
     print("=" * 60)
     print(f"  Uptime         : {h:02d}h {m:02d}m {s:02d}s  (cycle #{cycle})")
