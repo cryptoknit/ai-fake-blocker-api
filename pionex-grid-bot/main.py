@@ -12,24 +12,31 @@ Startup sequence
 3. Save state after every operation that mutates it.
 4. On clean Ctrl+C shutdown → cancel all orders, delete state file so the
    next startup builds a fresh grid rather than reconciling stale IDs.
+
+Circuit breaker
+---------------
+If MAX_LOSS > 0 and realized losses reach or exceed that threshold,
+CircuitBreakerTripped is raised.  The outer except block cancels all orders,
+deletes the state file, and exits with code 2.
 """
 
-import time
 import sys
+import time
 
 import config
 import pionex_client as client
 import state_store
+from circuit_breaker import CircuitBreakerTripped, check as cb_check
 from grid_engine import GridState, build_grid, update_state_from_fills
+from logger import alert, logger
+from monitor import display_status, log_cycle_summary
 from order_manager import (
-    place_grid_orders,
     cancel_all_orders,
     check_fills,
-    replace_filled_orders,
+    place_grid_orders,
     reconcile_saved_state,
+    replace_filled_orders,
 )
-from monitor import display_status, log_cycle_summary
-from logger import logger, alert
 
 
 def main() -> None:
@@ -45,6 +52,9 @@ def main() -> None:
         print("  *** DRY-RUN MODE — no real orders will be placed ***")
         print("=" * 60)
         logger.info("DRY-RUN mode enabled.")
+
+    if config.MAX_LOSS > 0:
+        logger.info("Circuit breaker enabled: max loss = %.6f USDT", config.MAX_LOSS)
 
     logger.info(
         "Starting Pionex Grid Bot | symbol=%s | range=[%.6f, %.6f] | levels=%d | invest=%.2f USDT",
@@ -86,12 +96,13 @@ def main() -> None:
             state.last_price = current_price
 
             if config.DRY_RUN:
-                # In dry-run mode there is no real exchange state to reconcile;
-                # just place fresh simulated orders for any empty slots.
                 place_grid_orders(state, current_price)
             else:
                 reconcile_saved_state(state, current_price)
 
+            # Check breaker after reconciliation — losses may have accumulated
+            # while the bot was offline (e.g. multiple sells filled at a loss).
+            cb_check(state.realized_pnl)
             state_store.save(state)
 
         else:
@@ -115,8 +126,6 @@ def main() -> None:
                 current_price    = client.get_price(config.SYMBOL)
                 state.last_price = current_price
 
-                # In dry-run mode advance the simulated order book before
-                # checking fills so the cycle sees up-to-date statuses.
                 if config.DRY_RUN:
                     import dry_run
                     dry_run.simulate_fills(current_price)
@@ -125,28 +134,39 @@ def main() -> None:
                 filled_orders = check_fills(state)
                 if filled_orders:
                     update_state_from_fills(state, filled_orders)
+                    # Check breaker immediately after P&L is updated — before
+                    # placing any new counter-orders.
+                    cb_check(state.realized_pnl)
                     replace_filled_orders(state)
-                    # Save immediately after fills so cost-basis and new order
-                    # IDs are persisted before the next potential crash window.
                     state_store.save(state)
 
                 # 2. Refresh console display
                 display_status(state, current_price, start_time, cycle)
                 log_cycle_summary(state, current_price, cycle)
 
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, CircuitBreakerTripped):
                 raise
             except Exception as exc:
                 alert(f"Unhandled error in cycle {cycle}: {exc}")
                 logger.exception("Cycle %d error", cycle)
                 display_status(state, state.last_price, start_time, cycle)
 
+    except CircuitBreakerTripped as exc:
+        print(f"\n\n{'!' * 60}")
+        print(f"  CIRCUIT BREAKER TRIPPED")
+        print(f"  {exc}")
+        print(f"{'!' * 60}")
+        logger.critical("Circuit breaker tripped — cancelling all orders and stopping.")
+        cancel_all_orders(state)
+        # Delete state so the next run starts fresh (don't resume into losses).
+        state_store.delete()
+        print(f"\nFinal realized P&L: {state.realized_pnl:+.6f} USDT")
+        sys.exit(2)
+
     except KeyboardInterrupt:
         print("\n\nStopping bot — cancelling all open orders …")
         logger.info("KeyboardInterrupt received; cancelling all orders.")
         cancel_all_orders(state)
-        # Clean shutdown: remove state file so next start builds a fresh grid
-        # rather than trying to reconcile the (now non-existent) orders.
         state_store.delete()
         logger.info(
             "All orders cancelled.  Bot stopped.  Final realized P&L: %.6f USDT",

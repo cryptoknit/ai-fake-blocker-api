@@ -36,6 +36,14 @@ def display_status(state: GridState, current_price: float,
     print(f"  Buy  fills     : {state.total_buy_fills}")
     print(f"  Sell fills     : {state.total_sell_fills}")
     print(f"  Realized P&L   : {state.realized_pnl:+.4f} USDT")
+
+    if config.MAX_LOSS > 0:
+        loss       = max(0.0, -state.realized_pnl)          # 0 when P&L is positive
+        used_frac  = min(1.0, loss / config.MAX_LOSS)
+        filled     = int(used_frac * 10)
+        bar        = "▓" * filled + "░" * (10 - filled)
+        print(f"  Max loss       : -{config.MAX_LOSS:.4f} USDT  [{bar}] {used_frac * 100:.1f}% consumed")
+
     print()
 
     # Show per-level order status

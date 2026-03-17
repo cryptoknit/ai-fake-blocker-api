@@ -28,6 +28,11 @@ LOOP_INTERVAL: int = int(os.getenv("LOOP_INTERVAL", "30"))     # Seconds between
 # When True, no real orders are placed.  Fill simulation is driven by live prices.
 DRY_RUN: bool = os.getenv("DRY_RUN", "false").strip().lower() in ("1", "true", "yes")
 
+# ── Circuit breaker ───────────────────────────────────────────────────────────
+# Cancel all orders and stop the bot if realized losses exceed this amount (USDT).
+# Set to 0 to disable.
+MAX_LOSS: float = float(os.getenv("MAX_LOSS", "0"))
+
 # ── Derived grid step ─────────────────────────────────────────────────────────
 GRID_STEP: float = (GRID_UPPER - GRID_LOWER) / GRID_COUNT
 
@@ -41,3 +46,5 @@ def validate() -> None:
         raise ValueError("GRID_COUNT must be at least 2")
     if INVESTMENT <= 0:
         raise ValueError("INVESTMENT must be positive")
+    if MAX_LOSS < 0:
+        raise ValueError("MAX_LOSS must be >= 0 (use 0 to disable the circuit breaker)")
